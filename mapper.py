@@ -17,7 +17,10 @@
 # 作業パス:
 #   - オプションで指定できる。
 #   - 未指定時はカレントディレクトリを作業パスとする。
-#   - 作業パス直下の .tree/ は予約ディレクトリとし、出力対象にも比較対象にも含めない。
+#   - 作業パス直下の .mapper/ は予約ディレクトリとし、出力対象にも比較対象にも含めない。
+#   - .mapperignore は mapper 用 ignore 設定ファイルとし、
+#     親ディレクトリ側の定義も、子ディレクトリ側の定義も適用できる。
+#   - .mapperignore 自体は出力対象にも比較対象にも含めない。
 #
 # 出力フォーマット:
 #   1行は以下の形式とする。
@@ -105,16 +108,17 @@
 #   - その他、木構造や属性解釈が不正である。
 #
 # 既存ツリーの扱い:
-#   - 作業パス配下を走査し、.tree/ を除外して現在状態を把握する。
+#   - 作業パス配下を走査し、.mapper/, 各階層の .mapperignore, および
+#     それらの指定パターンに一致するパスを除外して現在状態を把握する。
 #   - inode と実体パスの対応表を作る。
 #
 # 反映方式:
-#   入力反映時は、作業パス直下の .tree/ を退避用ディレクトリとして使う。
+#   入力反映時は、作業パス直下の .mapper/ を退避用ディレクトリとして使う。
 #
 # 反映前処理:
 #   - まず入力全体のパースと検証を完了させる。
-#   - .tree/ 配下を空にする。
-#   - 作業対象の既存ディレクトリ／ファイルを .tree/ に退避する。
+#   - .mapper/ 配下を空にする。
+#   - 作業対象の既存ディレクトリ／ファイルを .mapper/ に退避する。
 #
 # 反映処理順:
 #   1. 再配置
@@ -127,12 +131,12 @@
 #      - s <inode> を処理する。
 #
 # 削除対象:
-#   - 結果として使用されなかった既存物は .tree/ に残す。
+#   - 結果として使用されなかった既存物は .mapper/ に残す。
 #   - これらを削除候補として保全する。
 #
 # 失敗時の扱い:
 #   - 途中失敗時は自動ロールバックしない。
-#   - 失敗時点の状態と .tree/ 内の退避内容を残して停止する。
+#   - 失敗時点の状態と .mapper/ 内の退避内容を残して停止する。
 #   - 復旧しやすさを優先する。
 
 from __future__ import annotations
@@ -145,9 +149,11 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
-RESERVED_DIR = ".tree"
+RESERVED_DIR = ".mapper"
+IGNORE_FILE = ".mapperignore"
 ORIGINAL_DIR = "original"
 DELETED_DIR = "deleted"
 VALID_ESCAPES = {"\\", " ", "#", "+"}
@@ -188,8 +194,10 @@ OUTPUT_HEADER_LINES = [
     "#   - 属性（シンボリックリンク）は名前の後ろに空白区切りで書かれる",
     "#   - 出力に含まれる s:<inode> は、入力時は無視される",
     "#   - 行頭の # はコメント行として無視される",
+    "#   - 親・子ディレクトリの .mapperignore に書かれたパス・パターンが適用される",
+    "#   - .mapperignore 自体は出力・比較・反映の対象外になる",
     "#   - 名前中の空白, #, +, \\ は \\ でエスケープする",
-    "#   - 削除されたディレクトリ／ファイルは、作業パス配下の .tree/deleted/ に残される",
+    "#   - 削除されたディレクトリ／ファイルは、作業パス配下の .mapper/deleted/ に残される",
     "",
 ]
 
@@ -251,6 +259,35 @@ class CurrentEntry:
     is_symlink: bool
     link_target_inode: int | None = None
     is_dead_symlink: bool = False
+
+
+@dataclass(frozen=True)
+class IgnoreRule:
+    base_dir: Path
+    pattern: str
+    anchored: bool
+    dir_only: bool
+
+
+@dataclass(frozen=True)
+class IgnoreMatcher:
+    rules: tuple[IgnoreRule, ...]
+
+    def matches(self, path: Path, is_dir: bool) -> bool:
+        for rule in self.rules:
+            if rule.dir_only and not is_dir:
+                continue
+            try:
+                relative_path = path.relative_to(rule.base_dir)
+            except ValueError:
+                continue
+            rel = relative_path.as_posix()
+            if rel in {"", "."}:
+                continue
+            pure = PurePosixPath(rel)
+            if matches_ignore_rule(pure, rule):
+                return True
+        return False
 
 
 def main() -> int:
@@ -320,7 +357,8 @@ def emit_tree(
     with_footer: bool = True,
     max_depth: int | None = None,
 ) -> None:
-    entries = scan_current_tree(work_path)
+    ignore_matcher = load_ignore_matcher(work_path)
+    entries = scan_current_tree(work_path, ignore_matcher=ignore_matcher)
     root_stat = work_path.stat()
     lines = build_output_lines(work_path, entries, root_stat.st_ino, max_depth=max_depth)
     for line in lines:
@@ -437,14 +475,22 @@ def format_output_line(
 def scan_current_tree(
     work_path: Path,
     max_depth: int | None = None,
+    ignore_matcher: IgnoreMatcher | None = None,
 ) -> dict[Path, CurrentEntry]:
     entries: dict[Path, CurrentEntry] = {}
     if max_depth is not None and max_depth < 1:
         return entries
     for child in sorted(work_path.iterdir(), key=lambda path: path.name):
-        if child.name == RESERVED_DIR:
+        if should_ignore_path(child, work_path, ignore_matcher):
             continue
-        scan_entry(child, entries, depth=1, max_depth=max_depth)
+        scan_entry(
+            child,
+            entries,
+            depth=1,
+            max_depth=max_depth,
+            work_path=work_path,
+            ignore_matcher=ignore_matcher,
+        )
     return entries
 
 
@@ -453,6 +499,8 @@ def scan_entry(
     entries: dict[Path, CurrentEntry],
     depth: int,
     max_depth: int | None,
+    work_path: Path,
+    ignore_matcher: IgnoreMatcher | None,
 ) -> None:
     st = path.lstat()
     is_link = stat.S_ISLNK(st.st_mode)
@@ -477,17 +525,27 @@ def scan_entry(
     )
     if is_dir and not is_link and (max_depth is None or depth < max_depth):
         for child in sorted(path.iterdir(), key=lambda item: item.name):
-            scan_entry(child, entries, depth=depth + 1, max_depth=max_depth)
+            if should_ignore_path(child, work_path, ignore_matcher):
+                continue
+            scan_entry(
+                child,
+                entries,
+                depth=depth + 1,
+                max_depth=max_depth,
+                work_path=work_path,
+                ignore_matcher=ignore_matcher,
+            )
 
 
 def apply_spec(work_path: Path, spec_text: str) -> None:
+    ignore_matcher = load_ignore_matcher(work_path)
     parsed_lines = parse_input(spec_text)
     root = build_tree(parsed_lines)
-    current_entries = scan_current_tree(work_path)
+    current_entries = scan_current_tree(work_path, ignore_matcher=ignore_matcher)
     current_inode_map = {entry.inode: entry for entry in current_entries.values()}
-    validate_tree(root, work_path, current_inode_map)
+    validate_tree(root, work_path, current_inode_map, ignore_matcher)
     plan = make_plan(root, work_path, current_inode_map)
-    apply_plan(work_path, plan)
+    apply_plan(work_path, plan, ignore_matcher)
 
 
 @dataclass
@@ -562,18 +620,18 @@ def make_plan(
     )
 
 
-def apply_plan(work_path: Path, plan: Plan) -> None:
+def apply_plan(work_path: Path, plan: Plan, ignore_matcher: IgnoreMatcher) -> None:
     reserved_root = work_path / RESERVED_DIR
     original_root = reserved_root / ORIGINAL_DIR
     deleted_root = reserved_root / DELETED_DIR
 
     prepare_reserved_dir(reserved_root, original_root, deleted_root)
-    stage_existing_entries(work_path, original_root)
+    stage_existing_entries(work_path, original_root, ignore_matcher)
 
     for node in plan.existing_nodes:
-        relocate_existing_node(work_path, original_root, node)
+        relocate_existing_node(work_path, original_root, node, ignore_matcher)
 
-    prune_unwanted_entries(work_path, deleted_root, plan.desired_existing_inodes)
+    prune_unwanted_entries(work_path, deleted_root, plan.desired_existing_inodes, ignore_matcher)
 
     for node in plan.new_nodes:
         create_new_node(work_path, node)
@@ -593,18 +651,23 @@ def prepare_reserved_dir(reserved_root: Path, original_root: Path, deleted_root:
     deleted_root.mkdir()
 
 
-def stage_existing_entries(work_path: Path, original_root: Path) -> None:
+def stage_existing_entries(work_path: Path, original_root: Path, ignore_matcher: IgnoreMatcher) -> None:
     for child in sorted(work_path.iterdir(), key=lambda path: path.name):
-        if child.name == RESERVED_DIR:
+        if should_ignore_path(child, work_path, ignore_matcher):
             continue
         shutil.move(str(child), str(original_root / child.name))
 
 
-def relocate_existing_node(work_path: Path, original_root: Path, node: SpecNode) -> None:
+def relocate_existing_node(
+    work_path: Path,
+    original_root: Path,
+    node: SpecNode,
+    ignore_matcher: IgnoreMatcher,
+) -> None:
     if node.inode is None:
         raise TreeManagerError(f"{node.line_no}行目: inode なしノードを既存再配置として処理できません")
 
-    current_paths = collect_old_inode_paths(work_path, original_root)
+    current_paths = collect_old_inode_paths(work_path, original_root, ignore_matcher)
     source = current_paths.get(node.inode)
     if source is None:
         raise TreeManagerError(
@@ -624,13 +687,17 @@ def relocate_existing_node(work_path: Path, original_root: Path, node: SpecNode)
     shutil.move(str(source), str(destination))
 
 
-def collect_old_inode_paths(work_path: Path, original_root: Path) -> dict[int, Path]:
+def collect_old_inode_paths(
+    work_path: Path,
+    original_root: Path,
+    ignore_matcher: IgnoreMatcher,
+) -> dict[int, Path]:
     mapping: dict[int, Path] = {}
     for base in (work_path, original_root):
         if not base.exists():
             continue
         for child in sorted(base.iterdir(), key=lambda path: path.name):
-            if base == work_path and child.name == RESERVED_DIR:
+            if base == work_path and should_ignore_path(child, work_path, ignore_matcher):
                 continue
             scan_old_inode_paths(child, mapping)
     return mapping
@@ -649,11 +716,12 @@ def prune_unwanted_entries(
     work_path: Path,
     deleted_root: Path,
     desired_existing_inodes: set[int],
+    ignore_matcher: IgnoreMatcher,
 ) -> None:
     for child in sorted(work_path.iterdir(), key=lambda path: path.name):
-        if child.name == RESERVED_DIR:
+        if should_ignore_path(child, work_path, ignore_matcher):
             continue
-        prune_entry(child, work_path, deleted_root, desired_existing_inodes)
+        prune_entry(child, work_path, deleted_root, desired_existing_inodes, ignore_matcher)
 
 
 def prune_entry(
@@ -661,6 +729,7 @@ def prune_entry(
     work_path: Path,
     deleted_root: Path,
     desired_existing_inodes: set[int],
+    ignore_matcher: IgnoreMatcher,
 ) -> None:
     st = path.lstat()
     inode = st.st_ino
@@ -670,7 +739,9 @@ def prune_entry(
         return
     if path.is_dir() and not is_link:
         for child in sorted(path.iterdir(), key=lambda item: item.name):
-            prune_entry(child, work_path, deleted_root, desired_existing_inodes)
+            if should_ignore_path(child, work_path, ignore_matcher):
+                continue
+            prune_entry(child, work_path, deleted_root, desired_existing_inodes, ignore_matcher)
 
 
 def move_to_deleted(path: Path, work_path: Path, deleted_root: Path) -> None:
@@ -752,7 +823,12 @@ def collect_preserved_subtree_inodes(
     }
 
 
-def validate_tree(root: SpecNode, work_path: Path, current_inode_map: dict[int, CurrentEntry]) -> None:
+def validate_tree(
+    root: SpecNode,
+    work_path: Path,
+    current_inode_map: dict[int, CurrentEntry],
+    ignore_matcher: IgnoreMatcher,
+) -> None:
     current_root_inode = work_path.stat().st_ino
     if root.name != "./":
         raise TreeManagerError("先頭の有効行は ./ である必要があります")
@@ -770,6 +846,10 @@ def validate_tree(root: SpecNode, work_path: Path, current_inode_map: dict[int, 
             raise TreeManagerError(f"{node.line_no}行目: 親を特定できません")
         if not node.parent.is_dir:
             raise TreeManagerError(f"{node.line_no}行目: 親がファイルです")
+        if should_ignore_spec_path(work_path / node.relative_path, ignore_matcher, is_dir=node.is_dir):
+            raise TreeManagerError(
+                f"{node.line_no}行目: ignore 対象のパスは入力に含められません: {node.relative_path}"
+            )
         if node.children and not node.is_dir:
             raise TreeManagerError(f"{node.line_no}行目: ファイルは子ノードを持てません")
         if node.preserve_subtree and node.children:
@@ -984,6 +1064,96 @@ def normalize_node_name(value: str) -> str:
     if value.endswith("/"):
         return value[:-1]
     return value
+
+
+def load_ignore_matcher(work_path: Path) -> IgnoreMatcher:
+    rules = [
+        IgnoreRule(base_dir=work_path, pattern=RESERVED_DIR, anchored=True, dir_only=True),
+    ]
+    for directory in iter_parent_dirs(work_path):
+        ignore_file = directory / IGNORE_FILE
+        if not ignore_file.exists():
+            continue
+        rules.extend(load_ignore_rules_from_file(ignore_file))
+
+    for directory, child_dirs, _files in os.walk(work_path, topdown=True):
+        current_dir = Path(directory)
+        if current_dir == work_path / RESERVED_DIR:
+            child_dirs[:] = []
+            continue
+        ignore_file = current_dir / IGNORE_FILE
+        if current_dir != work_path and ignore_file.exists():
+            rules.extend(load_ignore_rules_from_file(ignore_file))
+
+        kept_dirs: list[str] = []
+        for child_name in child_dirs:
+            child_path = current_dir / child_name
+            if should_ignore_path(child_path, work_path, IgnoreMatcher(tuple(rules))):
+                continue
+            kept_dirs.append(child_name)
+        child_dirs[:] = kept_dirs
+
+    return IgnoreMatcher(tuple(rules))
+
+
+def load_ignore_rules_from_file(ignore_file: Path) -> list[IgnoreRule]:
+    rules: list[IgnoreRule] = []
+    for line_no, raw_line in enumerate(ignore_file.read_text().splitlines(), start=1):
+        rule = parse_ignore_rule(ignore_file.parent, raw_line, line_no)
+        if rule is not None:
+            rules.append(rule)
+    return rules
+
+
+def parse_ignore_rule(base_dir: Path, raw_line: str, line_no: int) -> IgnoreRule | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    anchored = line.startswith("/")
+    if anchored:
+        line = line[1:]
+    dir_only = line.endswith("/")
+    if dir_only:
+        line = line[:-1]
+    if not line:
+        raise TreeManagerError(f"{IGNORE_FILE}:{line_no}: ignore パターンが不正です")
+    return IgnoreRule(base_dir=base_dir, pattern=line, anchored=anchored, dir_only=dir_only)
+
+
+def should_ignore_path(path: Path, work_path: Path, ignore_matcher: IgnoreMatcher | None) -> bool:
+    if path == work_path / RESERVED_DIR:
+        return True
+    if path.name == IGNORE_FILE:
+        return True
+    if ignore_matcher is None:
+        return False
+    is_dir = False
+    try:
+        is_dir = path.is_dir() and not path.is_symlink()
+    except FileNotFoundError:
+        pass
+    return ignore_matcher.matches(path, is_dir=is_dir)
+
+
+def should_ignore_spec_path(path: Path, ignore_matcher: IgnoreMatcher, is_dir: bool) -> bool:
+    if path.name == IGNORE_FILE:
+        return True
+    if path.name == RESERVED_DIR and is_dir:
+        return True
+    return ignore_matcher.matches(path, is_dir=is_dir)
+
+
+def matches_ignore_rule(path: PurePosixPath, rule: IgnoreRule) -> bool:
+    if rule.anchored:
+        return path.match(rule.pattern)
+    return path.match(rule.pattern) or path.match(f"**/{rule.pattern}")
+
+
+def iter_parent_dirs(work_path: Path) -> list[Path]:
+    parents = [work_path]
+    parents.extend(work_path.parents)
+    parents.reverse()
+    return parents
 
 
 def is_output_only_attr(token: str) -> bool:

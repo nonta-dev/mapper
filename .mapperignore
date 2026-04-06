@@ -1,0 +1,5 @@
+# Paths ignored by mapper.
+# Parent directories' .mapperignore files also apply here.
+# A child directory's .mapperignore applies only under that child.
+.git/
+__pycache__/
