@@ -12,6 +12,7 @@
 # 基本動作:
 #   1. 標準出力へ現在のファイルツリーを出力できる。
 #   2. 標準入力からツリー定義を受け取り、作業パス配下を更新できる。
+#   3. -d N は出力時専用で、標準入力からの反映時に指定してはならない。
 #
 # 作業パス:
 #   - オプションで指定できる。
@@ -30,6 +31,7 @@
 #   - escaped_name
 #       ディレクトリ名またはファイル名。
 #       ディレクトリは末尾 / で表現する。
+#       深さ制限により配下を省略した既存ディレクトリは末尾 /* で表現する。
 #       以下をエスケープ可能とする。
 #         \\  バックスラッシュ
 #         \   半角スペース
@@ -61,6 +63,7 @@
 #   - inode は省略可能。
 #       省略時は新規作成とみなす。
 #   - 属性部に操作を記述できる。
+#   - dir/* は既存ディレクトリの subtree を個別に列挙せず保持することを表す。
 #
 # 入力時の属性:
 #   - <inode>
@@ -78,6 +81,7 @@
 # 新規作成:
 #   - inode のないディレクトリは新規ディレクトリ作成とする。
 #   - inode のないファイルは空ファイル作成とする。
+#   - dir/* は新規ディレクトリには使用できない。
 #
 # コメントアウトの意味:
 #   - コメントアウトされたノード自体は無効とし、削除対象とする。
@@ -90,9 +94,12 @@
 #
 # 検証エラーとする条件:
 #   - ルート ./ が存在しない。
+#   - 入力反映時に -d が指定されている。
 #   - 参照先 inode が既存ツリー内に存在しない。
 #   - 同一ディレクトリ内に同名項目がある。
 #   - ファイルノードが子を持つ。
+#   - dir/* ノードが子を持つ。
+#   - dir/* が既存ディレクトリを指していない。
 #   - h の参照先がディレクトリである。
 #   - 通常ノードとして同じ inode が複数回現れる。
 #   - その他、木構造や属性解釈が不正である。
@@ -149,20 +156,23 @@ VERSION = "0.1.0"
 OUTPUT_HEADER_LINES = [
     "",
     "# 出力フォーマット：",
-    "#   ./                           ルートディレクトリ。",
-    "#     name/  <inode>             ディレクトリ。",
-    "#     name   <inode>             ファイル。",
-    "#     name   <inode> s:<inode>   シンボリックリンク。s:参照元ファイル。",
+    "#   ./                            ルートディレクトリ。",
+    "#     name/   <inode>             ディレクトリ。",
+    "#     name/*  <inode>             子要素を省略して保持する既存ディレクトリ。",
+    "#     name    <inode>             ファイル。",
+    "#     name    <inode> s:<inode>   シンボリックリンク。s:参照元ファイル。",
     "#",
     "# 入力フォーマット（操作）：",
     "#   既存を維持：",
     "#     行をそのまま残す。",
+    "#   既存 subtree を省略して維持：",
+    "#     name/*  <inode>",
     "#   移動：",
     "#     行、インデントを変更。。",
     "#   削除：",
     "#     行を削除する。（コメントアウトでもOK）",
     "#   コピー：",
-    "#     name   c:<inode>",
+    "#     name   c <inode>",
     "#   シンボリックリンクを作成：",
     "#     name   s <inode>",
     "#   ハードリンクを作成：",
@@ -172,6 +182,9 @@ OUTPUT_HEADER_LINES = [
     "#   - 先頭の有効行は ./ で始める",
     "#   - 子要素は親より深くインデントする",
     "#   - ディレクトリ名は / で終える",
+    "#   - name/* はそのディレクトリ配下の既存 subtree を保持する",
+    "#   - -d N は出力時専用。出力時の表示深さを N 階層までに制限する",
+    "#   - -d により子要素が省略された既存ディレクトリは name/* で出力される",
     "#   - 属性（シンボリックリンク）は名前の後ろに空白区切りで書かれる",
     "#   - 出力に含まれる s:<inode> は、入力時は無視される",
     "#   - 行頭の # はコメント行として無視される",
@@ -199,6 +212,7 @@ class SpecNode:
     indent: int
     name: str
     is_dir: bool
+    preserve_subtree: bool = False
     inode: int | None = None
     op: str | None = None
     op_target_inode: int | None = None
@@ -220,9 +234,13 @@ class SpecNode:
         parts: list[str] = []
         node: SpecNode | None = self
         while node is not None and node.parent is not None:
-            parts.append(node.name.rstrip("/"))
+            parts.append(node.path_name)
             node = node.parent
         return Path(*reversed(parts))
+
+    @property
+    def path_name(self) -> str:
+        return normalize_node_name(self.name)
 
 
 @dataclass
@@ -242,13 +260,15 @@ def main() -> int:
         raise TreeManagerError(f"作業パスがディレクトリではありません: {work_path}")
 
     if sys.stdin.isatty():
-        emit_tree(work_path, with_header=not args.simple)
+        emit_tree(work_path, with_footer=not args.simple, max_depth=args.depth)
     else:
+        if args.depth is not None:
+            raise TreeManagerError("-d / --depth は出力時専用です")
         spec_text = sys.stdin.read()
         if spec_text.strip():
             apply_spec(work_path, spec_text)
         else:
-            emit_tree(work_path, with_header=not args.simple)
+            emit_tree(work_path, with_footer=not args.simple, max_depth=args.depth)
     return 0
 
 
@@ -274,16 +294,38 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="ツリー出力時にフッタ（説明書）を付けない",
     )
+    parser.add_argument(
+        "-d",
+        "--depth",
+        type=parse_depth,
+        default=None,
+        metavar="N",
+        help="出力時専用。ツリーの表示深さを N 階層までに制限する。0 なら ./ のみ",
+    )
     return parser.parse_args()
 
 
-def emit_tree(work_path: Path, with_header: bool = True) -> None:
+def parse_depth(value: str) -> int:
+    try:
+        depth = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("深さは 0 以上の整数で指定してください") from error
+    if depth < 0:
+        raise argparse.ArgumentTypeError("深さは 0 以上の整数で指定してください")
+    return depth
+
+
+def emit_tree(
+    work_path: Path,
+    with_footer: bool = True,
+    max_depth: int | None = None,
+) -> None:
     entries = scan_current_tree(work_path)
     root_stat = work_path.stat()
-    lines = build_output_lines(work_path, entries, root_stat.st_ino)
+    lines = build_output_lines(work_path, entries, root_stat.st_ino, max_depth=max_depth)
     for line in lines:
         print(line)
-    if with_header:
+    if with_footer:
         for line in OUTPUT_HEADER_LINES:
             print(line)
 
@@ -291,12 +333,13 @@ def build_output_lines(
     work_path: Path,
     entries: dict[Path, CurrentEntry],
     root_inode: int,
+    max_depth: int | None = None,
 ) -> list[str]:
     rows: list[tuple[int, str, list[str]]] = [(0, "./", [str(root_inode)])]
     for child in sorted(entries.values(), key=lambda entry: entry.path.name):
         if child.path.parent != work_path:
             continue
-        collect_output_rows(child, entries, 1, rows)
+        collect_output_rows(child, entries, 1, rows, max_depth=max_depth)
 
     name_width = max(display_width((OUTPUT_INDENT * depth) + escape_name(name)) for depth, name, _ in rows)
     attr_widths = compute_attr_widths(rows)
@@ -308,8 +351,28 @@ def collect_output_rows(
     entries: dict[Path, CurrentEntry],
     depth: int,
     rows: list[tuple[int, str, list[str]]],
+    max_depth: int | None = None,
 ) -> None:
-    display_name = entry.path.name + ("/" if entry.is_dir and not entry.is_symlink else "")
+    if max_depth is not None and depth > max_depth:
+        return
+
+    children = [
+        child
+        for child in entries.values()
+        if child.path.parent == entry.path
+    ]
+    has_visible_children = bool(children)
+    truncated = (
+        entry.is_dir
+        and not entry.is_symlink
+        and max_depth is not None
+        and depth >= max_depth
+        and has_visible_children
+    )
+    if entry.is_dir and not entry.is_symlink:
+        display_name = entry.path.name + ("/*" if truncated else "/")
+    else:
+        display_name = entry.path.name
     attrs = [str(entry.inode)]
     if entry.is_symlink:
         if entry.is_dead_symlink:
@@ -318,16 +381,10 @@ def collect_output_rows(
             attrs.append(f"s:{entry.link_target_inode}")
     rows.append((depth, display_name, attrs))
 
-    if not entry.is_dir or entry.is_symlink:
+    if not entry.is_dir or entry.is_symlink or truncated:
         return
-
-    children = [
-        child
-        for child in entries.values()
-        if child.path.parent == entry.path
-    ]
     for child in sorted(children, key=lambda item: item.path.name):
-        collect_output_rows(child, entries, depth + 1, rows)
+        collect_output_rows(child, entries, depth + 1, rows, max_depth=max_depth)
 
 def compute_attr_widths(rows: list[tuple[int, str, list[str]]]) -> list[int]:
     max_columns = max((len(attrs) for _, _, attrs in rows), default=0)
@@ -377,16 +434,26 @@ def format_output_line(
     return "".join(parts)
 
 
-def scan_current_tree(work_path: Path) -> dict[Path, CurrentEntry]:
+def scan_current_tree(
+    work_path: Path,
+    max_depth: int | None = None,
+) -> dict[Path, CurrentEntry]:
     entries: dict[Path, CurrentEntry] = {}
+    if max_depth is not None and max_depth < 1:
+        return entries
     for child in sorted(work_path.iterdir(), key=lambda path: path.name):
         if child.name == RESERVED_DIR:
             continue
-        scan_entry(child, entries)
+        scan_entry(child, entries, depth=1, max_depth=max_depth)
     return entries
 
 
-def scan_entry(path: Path, entries: dict[Path, CurrentEntry]) -> None:
+def scan_entry(
+    path: Path,
+    entries: dict[Path, CurrentEntry],
+    depth: int,
+    max_depth: int | None,
+) -> None:
     st = path.lstat()
     is_link = stat.S_ISLNK(st.st_mode)
     is_dir = path.is_dir() if not is_link else False
@@ -408,9 +475,9 @@ def scan_entry(path: Path, entries: dict[Path, CurrentEntry]) -> None:
         link_target_inode=link_target_inode,
         is_dead_symlink=is_dead_symlink,
     )
-    if is_dir and not is_link:
+    if is_dir and not is_link and (max_depth is None or depth < max_depth):
         for child in sorted(path.iterdir(), key=lambda item: item.name):
-            scan_entry(child, entries)
+            scan_entry(child, entries, depth=depth + 1, max_depth=max_depth)
 
 
 def apply_spec(work_path: Path, spec_text: str) -> None:
@@ -464,6 +531,13 @@ def make_plan(
     if root.inode is not None:
         desired_existing_inodes.add(root.inode)
         active_inode_targets[root.inode] = Path(".")
+
+    for node in existing_nodes:
+        if not node.preserve_subtree or node.inode is None:
+            continue
+        desired_existing_inodes.update(
+            collect_preserved_subtree_inodes(node.inode, current_inode_map)
+        )
 
     for node in op_nodes:
         if node.op_target_inode is None:
@@ -665,6 +739,19 @@ def apply_operation_node(
     raise TreeManagerError(f"{node.line_no}行目: 未対応の操作です: {node.op}")
 
 
+def collect_preserved_subtree_inodes(
+    inode: int,
+    current_inode_map: dict[int, CurrentEntry],
+) -> set[int]:
+    root_entry = current_inode_map[inode]
+    root_path = root_entry.path
+    return {
+        entry.inode
+        for entry in current_inode_map.values()
+        if entry.path == root_path or root_path in entry.path.parents
+    }
+
+
 def validate_tree(root: SpecNode, work_path: Path, current_inode_map: dict[int, CurrentEntry]) -> None:
     current_root_inode = work_path.stat().st_ino
     if root.name != "./":
@@ -685,6 +772,8 @@ def validate_tree(root: SpecNode, work_path: Path, current_inode_map: dict[int, 
             raise TreeManagerError(f"{node.line_no}行目: 親がファイルです")
         if node.children and not node.is_dir:
             raise TreeManagerError(f"{node.line_no}行目: ファイルは子ノードを持てません")
+        if node.preserve_subtree and node.children:
+            raise TreeManagerError(f"{node.line_no}行目: dir/* ノードは子ノードを持てません")
 
         if node.op is not None and node.children:
             raise TreeManagerError(f"{node.line_no}行目: 操作ノードは子ノードを持てません")
@@ -705,6 +794,14 @@ def validate_tree(root: SpecNode, work_path: Path, current_inode_map: dict[int, 
                     f"{node.line_no}行目: 同じ inode が複数回使われています: {node.inode}"
                 )
             seen_existing_inodes[node.inode] = node
+            if node.preserve_subtree and not current.is_dir:
+                raise TreeManagerError(f"{node.line_no}行目: dir/* は既存ディレクトリにのみ指定できます")
+
+        if node.preserve_subtree:
+            if not node.is_dir:
+                raise TreeManagerError(f"{node.line_no}行目: dir/* はディレクトリにのみ指定できます")
+            if node.inode is None:
+                raise TreeManagerError(f"{node.line_no}行目: dir/* は既存ディレクトリにのみ指定できます")
 
         if node.op is not None:
             if node.op_target_inode is None:
@@ -725,7 +822,7 @@ def validate_unique_sibling_names(node: SpecNode) -> None:
         return
     seen: set[str] = set()
     for child in node.children:
-        normalized = child.name.rstrip("/")
+        normalized = normalize_node_name(child.name)
         if normalized in seen:
             raise TreeManagerError(
                 f"{child.line_no}行目: 同一ディレクトリ内に同名項目があります: {normalized}"
@@ -764,7 +861,8 @@ def build_tree(parsed_lines: list[ParsedLine]) -> SpecNode:
 
 def build_node(parsed: ParsedLine) -> SpecNode:
     name = parsed.name
-    is_dir = name == "./" or name.endswith("/")
+    preserve_subtree = name.endswith("/*")
+    is_dir = name == "./" or name.endswith("/") or preserve_subtree
     inode: int | None = None
     op: str | None = None
     op_target_inode: int | None = None
@@ -792,6 +890,7 @@ def build_node(parsed: ParsedLine) -> SpecNode:
         indent=parsed.indent,
         name=name,
         is_dir=is_dir,
+        preserve_subtree=preserve_subtree,
         inode=inode,
         op=op,
         op_target_inode=op_target_inode,
@@ -877,6 +976,14 @@ def escape_name(value: str) -> str:
             result.append("\\")
         result.append(char)
     return "".join(result)
+
+
+def normalize_node_name(value: str) -> str:
+    if value.endswith("/*"):
+        return value[:-2]
+    if value.endswith("/"):
+        return value[:-1]
+    return value
 
 
 def is_output_only_attr(token: str) -> bool:
